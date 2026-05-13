@@ -1,0 +1,244 @@
+# -*- coding: utf-8 -*-
+# // [NEW v9.5.0 | 2026-04-18] Purpose: Lazy-translated continuation words
+# // and recipe indicator words. Mirrors the architecture of localized_strings
+# // and trigger_manager: an English master list, on-demand translation per
+# // language via the smart router, and a persistent on-disk cache. Lets the
+# // dispatcher perform continuation heuristics in any UI language without
+# // ANY hardcoded non-English text inside the dispatcher itself.
+
+import json
+import logging
+import os
+import asyncio
+
+from .router import safe_smart_router
+from .json_utils import safe_parse_json
+
+_LOGGER = logging.getLogger(__name__)
+
+
+# ==========================================
+# MASTER LISTS (English only)
+# ==========================================
+# Bare affirmative/advance words a user might say to step through a recipe
+# ("next", "continue", "keep going", "go", "yes", "ready", ...).
+MASTER_CONTINUATION_EN = [
+    "next",
+    "continue",
+    "done",
+    "ready",
+    "go",
+    "start",
+    "keep going",
+    "step by step",
+    "let's go",
+    "yes",
+]
+
+# Words the cooking agent uses in its responses. We scan previous assistant
+# turns for these to decide whether a bare "next" from the user should route
+# to cooking or stay at the default inventory agent.
+MASTER_RECIPE_INDICATORS_EN = [
+    "recipe",
+    "step-by-step",
+    "step by step",
+    "ingredients",
+]
+
+
+# ==========================================
+# CACHE FILE
+# ==========================================
+def _cache_path(hass):
+    return hass.config.path("home_organizer_continuation_cache.json")
+
+
+_MEMORY_CACHE = None
+_MEMORY_CACHE_LOCK = asyncio.Lock()
+_PENDING_TRANSLATIONS = set()
+
+
+LANG_NAME_MAP = {
+    "en": "English",  "he": "Hebrew",   "fr": "French",
+    "es": "Spanish",  "it": "Italian",  "de": "German",
+    "ru": "Russian",  "ar": "Arabic",   "pt": "Portuguese",
+    "nl": "Dutch",    "pl": "Polish",   "tr": "Turkish",
+    "ja": "Japanese", "ko": "Korean",   "zh": "Chinese",
+}
+
+
+def _load_cache_from_disk_sync(path):
+    if not os.path.exists(path):
+        return {"languages": {}}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if "languages" not in data:
+            data = {"languages": {}}
+        return data
+    except Exception as e:
+        _LOGGER.error(f"Failed to read continuation cache: {e}")
+        return {"languages": {}}
+
+
+def _save_cache_to_disk_sync(path, data):
+    try:
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, path)
+    except Exception as e:
+        _LOGGER.error(f"Failed to write continuation cache: {e}")
+
+
+async def _ensure_memory_cache_loaded(hass):
+    global _MEMORY_CACHE
+    if _MEMORY_CACHE is not None:
+        return
+    async with _MEMORY_CACHE_LOCK:
+        if _MEMORY_CACHE is not None:
+            return
+        path = _cache_path(hass)
+        _MEMORY_CACHE = await hass.async_add_executor_job(
+            _load_cache_from_disk_sync, path
+        )
+        _LOGGER.info(
+            f"Continuation cache loaded. Cached languages: "
+            f"{list(_MEMORY_CACHE.get('languages', {}).keys())}"
+        )
+
+
+async def _persist_cache(hass):
+    if _MEMORY_CACHE is None:
+        return
+    snapshot = json.loads(json.dumps(_MEMORY_CACHE))
+    await hass.async_add_executor_job(
+        _save_cache_to_disk_sync, _cache_path(hass), snapshot
+    )
+
+
+# ==========================================
+# TRANSLATION
+# ==========================================
+def _build_translation_prompt(lang_code):
+    lang_name = LANG_NAME_MAP.get(lang_code, lang_code)
+    master = json.dumps({
+        "continuation_words": MASTER_CONTINUATION_EN,
+        "recipe_indicators": MASTER_RECIPE_INDICATORS_EN,
+    }, ensure_ascii=False, indent=2)
+    return f"""You are a multilingual translator for a smart home voice assistant.
+
+Translate every word/phrase in BOTH lists into natural spoken {lang_name}.
+
+continuation_words are short imperatives a user might say to advance through
+a recipe ("next", "continue", "keep going", "yes", "ready"...).
+
+recipe_indicators are nouns a recipe assistant uses in its responses (e.g.
+"recipe", "step-by-step", "ingredients"). We scan previous assistant replies
+for these to detect that a recipe context is active.
+
+CRITICAL OUTPUT RULES:
+1. Return ONLY a valid JSON object. No markdown, no explanation.
+2. Same two keys: "continuation_words" and "recipe_indicators".
+3. Each value is an array of lowercase strings in {lang_name}.
+4. You MAY add up to 3 extra common natural variants per list that a native
+   {lang_name} speaker would really say in this context.
+5. Never translate into English if the target language is not English.
+
+INPUT (English master):
+{master}
+
+OUTPUT (JSON only, in {lang_name}):"""
+
+
+async def _translate(hass, entry, lang_code):
+    _LOGGER.info(f"Translating continuation words to '{lang_code}'...")
+    prompt = _build_translation_prompt(lang_code)
+    raw, err = await safe_smart_router(hass, entry, prompt)
+
+    if err or not raw:
+        _LOGGER.warning(f"Continuation translation failed for '{lang_code}': {err}")
+        return None
+
+    parsed = safe_parse_json(raw)
+    if not isinstance(parsed, dict):
+        return None
+
+    cont = parsed.get("continuation_words")
+    rec = parsed.get("recipe_indicators")
+
+    if not isinstance(cont, list) or not cont:
+        cont = list(MASTER_CONTINUATION_EN)
+    if not isinstance(rec, list) or not rec:
+        rec = list(MASTER_RECIPE_INDICATORS_EN)
+
+    return {
+        "continuation_words": [
+            str(x).strip().lower() for x in cont if str(x).strip()
+        ],
+        "recipe_indicators": [
+            str(x).strip().lower() for x in rec if str(x).strip()
+        ],
+    }
+
+
+async def _ensure_language_cached(hass, entry, lang_code):
+    await _ensure_memory_cache_loaded(hass)
+    languages = _MEMORY_CACHE.setdefault("languages", {})
+
+    if lang_code in languages:
+        return
+
+    if lang_code in _PENDING_TRANSLATIONS:
+        for _ in range(20):
+            await asyncio.sleep(0.25)
+            if lang_code in languages:
+                return
+        return
+
+    _PENDING_TRANSLATIONS.add(lang_code)
+    try:
+        translated = await _translate(hass, entry, lang_code)
+        if translated:
+            languages[lang_code] = translated
+            await _persist_cache(hass)
+            _LOGGER.info(f"Continuation cache updated with language '{lang_code}'.")
+    finally:
+        _PENDING_TRANSLATIONS.discard(lang_code)
+
+
+# ==========================================
+# PUBLIC API
+# ==========================================
+async def get_continuation_words(hass, entry, lang_code):
+    """Continuation trigger words localized to `lang_code`."""
+    if not lang_code:
+        lang_code = "en"
+    lang_code = lang_code.lower().split("-")[0]
+
+    if lang_code == "en":
+        return list(MASTER_CONTINUATION_EN)
+
+    await _ensure_language_cached(hass, entry, lang_code)
+    languages = _MEMORY_CACHE.get("languages", {}) if _MEMORY_CACHE else {}
+    entry_data = languages.get(lang_code)
+    if not entry_data:
+        return list(MASTER_CONTINUATION_EN)
+    return entry_data.get("continuation_words") or list(MASTER_CONTINUATION_EN)
+
+
+async def get_recipe_indicators(hass, entry, lang_code):
+    """Recipe-indicator words localized to `lang_code`."""
+    if not lang_code:
+        lang_code = "en"
+    lang_code = lang_code.lower().split("-")[0]
+
+    if lang_code == "en":
+        return list(MASTER_RECIPE_INDICATORS_EN)
+
+    await _ensure_language_cached(hass, entry, lang_code)
+    languages = _MEMORY_CACHE.get("languages", {}) if _MEMORY_CACHE else {}
+    entry_data = languages.get(lang_code)
+    if not entry_data:
+        return list(MASTER_RECIPE_INDICATORS_EN)
+    return entry_data.get("recipe_indicators") or list(MASTER_RECIPE_INDICATORS_EN)

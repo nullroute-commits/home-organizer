@@ -1,0 +1,3 @@
+/* pages/search.css | v10.0.1 */
+.search-results-container { padding: 10px; display: flex; flex-direction: column; gap: 10px; }
+.no-results-msg { text-align: center; padding: 30px; color: var(--text-sub); font-style: italic; }

@@ -1,0 +1,12 @@
+/* pages/shopping.css | v10.0.1 */
+.shop-tabs { display: flex; background: var(--bg-card); border-radius: 8px; padding: 4px; border: 1px solid var(--border-light); }
+.shop-tab { flex: 1; text-align: center; padding: 8px; border-radius: 6px; font-size: 14px; font-weight: bold; color: var(--text-sub); cursor: pointer; transition: all 0.2s; }
+.shop-tab.active { background: var(--primary); color: white; }
+
+.shop-badge { background: var(--danger); color: white; padding: 2px 6px; border-radius: 12px; font-size: 11px; margin-inline-start: 6px; }
+
+.pending-card { background: var(--bg-card); border: 1px solid var(--border-light); border-radius: 12px; padding: 15px; margin-bottom: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+.pending-top { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+.pending-name-input { font-size: 16px; font-weight: bold; background: var(--bg-input-edit); color: var(--text-main); border: 1px solid var(--border-light); padding: 8px; border-radius: 6px; box-sizing:border-box;}
+.pending-qty-input { width: 60px; font-size: 16px; text-align: center; padding: 8px; background: var(--bg-input-edit); color: var(--text-main); border: 1px solid var(--border-light); border-radius: 6px; font-weight: bold; }
+.pending-actions { display: flex; justify-content: space-between; border-top: 1px solid var(--border-light); padding-top: 12px; }

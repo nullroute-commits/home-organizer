@@ -1,6 +1,5 @@
-/* Home Organizer CSS - Ver 7.6.31 */
-/* [MODIFIED v7.6.21 | 2026-02-18] Purpose: Increased folder icon display sizes by ~30% per user request */
-/* [MODIFIED v7.6.22 | 2026-02-18] Purpose: Increased folder icon display sizes by an additional 20% per user request */
+/* Home Organizer CSS - Ver 7.7.33 */
+/* [ADDED v7.7.33 | 2026-04-01] Purpose: Added CSS rules to support dragging the Speed Dial button */
 
 :host { 
     --primary: #03a9f4; --accent: #4caf50; --danger: #f44336; --warning: #ffeb3b; --icon-btn-bg: #444;
@@ -271,3 +270,66 @@ summary.debug-summary:hover { background: #222244; }
 .light-mode .shop-tab { background:#f5f5f5; color:#000; border-color:#cccccc; }
 .light-mode .shop-tab.active { background:var(--primary); color:white; border-color:var(--primary); }
 .light-mode .pending-name-input, .light-mode .pending-qty-input { background:#ffffff; color:#000000; border-color:#cccccc; }
+/* [ADDED v7.7.33] Styling for draggable Speed Dial */
+.fab-draggable-active { cursor: grab; touch-action: none; user-select: none; }
+.fab-draggable-active:active { cursor: grabbing; }
+
+/* --- [MODIFIED v7.7.38] Perfect FAB Button Alignment and Logic --- */
+
+.fab-menu {
+    display: flex;
+    flex-direction: column;
+    align-items: center; 
+    width: 60px;         
+    gap: 12px;
+    opacity: 0;
+    visibility: hidden;
+    transform: translateY(20px) scale(0.8);
+    transition: all 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+    transform-origin: bottom center;
+}
+
+.fab-item-wrapper {
+    position: relative; 
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    width: 50px;
+    height: 50px;
+}
+
+/* Tooltip Base */
+.fab-tooltip {
+    background: var(--bg-card, #333);
+    color: var(--text-main, #fff);
+    padding: 6px 12px;
+    border-radius: 6px;
+    font-size: 14px;
+    font-weight: 500;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+    white-space: nowrap;
+    border: 1px solid var(--border-light, #444);
+    position: absolute;
+    top: 50%;
+    transform: translateY(-50%);
+    pointer-events: none;
+    z-index: 1001;
+}
+
+/* 5. Tooltip Positioning: RTL (Hebrew - Default) */
+/* FAB is on the left side of screen -> Text goes on the RIGHT side of the button */
+.fab-tooltip {
+    right: 100%;
+    left: auto;
+    margin-left: 15px;
+    margin-right: 0;
+}
+
+/* 6. Tooltip Positioning: LTR (English) */
+/* FAB is on the right side of screen -> Text goes on the LEFT side of the button */
+.ltr .fab-tooltip, #app.ltr .fab-tooltip {
+    left: 100%;
+    right: auto;
+    margin-right: 15px;
+    margin-left: 0;
+}

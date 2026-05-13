@@ -1,0 +1,36 @@
+/* pages/stylist.css | v10.2.1 */
+/* [MODIFIED v10.2.1] Removed column-reverse to forcefully lock layout to Wardrobe=Top (3/4) and Chat=Bottom (1/4) on all mobile devices. */
+
+.stylist-split-container { display:flex; flex-direction:column; flex:1; min-height:0; overflow:hidden; }
+
+/* Wardrobe Area is Top (3/4 Screen) */
+.stylist-wardrobe-area { flex:3; display:flex; flex-direction:row; border-bottom:1px solid var(--border-light); background:var(--bg-bar); position:relative; min-height:0; overflow:hidden; }
+
+/* Chat Area is Bottom (1/4 Screen) */
+.stylist-chat-area { flex:1; display:flex; flex-direction:column; min-height:0; overflow:hidden; background:var(--bg-body); }
+
+.stylist-grid { flex:1; overflow-y:auto; display:grid; grid-template-columns:repeat(auto-fill, minmax(90px, 1fr)); gap:10px; padding:10px; padding-top:55px; align-content:start; }
+.stylist-sidebar { width:75px; overflow-y:auto; border-inline-start:1px solid var(--border-light); display:flex; flex-direction:column; gap:8px; padding:8px 5px; background:var(--bg-card); flex-shrink:0; }
+
+@media (max-width: 768px) {
+  .stylist-sidebar { width: 65px; padding: 5px; }
+}
+
+.stylist-cat-btn { background:var(--bg-input); border:1px solid var(--border-light); border-radius:8px; padding:10px 2px; color:var(--text-sub); display:flex; flex-direction:column; align-items:center; gap:4px; font-size:10px; cursor:pointer; text-align:center; transition:all 0.2s; }
+.stylist-cat-btn.active { background:rgba(3,169,244,0.15); border-color:var(--primary); color:var(--primary); font-weight:bold; }
+.stylist-item-card { background:var(--bg-card); border-radius:8px; border:2px solid transparent; overflow:hidden; position:relative; cursor:pointer; aspect-ratio:1; box-shadow:0 2px 5px rgba(0,0,0,0.2); transition:all 0.2s; }
+.stylist-item-card.selected { border-color:var(--primary); transform:scale(0.95); }
+.stylist-item-card img { width:100%; height:100%; object-fit:cover; }
+.stylist-item-check { position:absolute; top:5px; inset-inline-start:5px; background:var(--primary); color:white; border-radius:50%; width:20px; height:20px; display:flex; align-items:center; justify-content:center; font-size:12px; opacity:0; transition:opacity 0.2s; box-shadow:0 2px 4px rgba(0,0,0,0.4); }
+.stylist-item-card.selected .stylist-item-check { opacity:1; }
+.stylist-item-zoom { position:absolute; bottom:5px; inset-inline-end:5px; background:rgba(0,0,0,0.6); color:white; border-radius:50%; width:24px; height:24px; display:flex; align-items:center; justify-content:center; padding:4px; opacity:0.8; transition:opacity 0.2s; }
+.stylist-item-zoom:hover { opacity:1; background:rgba(0,0,0,0.9); }
+.stylist-item-zoom svg { width:14px; height:14px; }
+.stylist-filter-bar { position:absolute; top:0; inset-inline-start:0; inset-inline-end:75px; background:rgba(0,0,0,0.6); backdrop-filter:blur(5px); padding:10px; display:flex; gap:10px; z-index:10; border-bottom:1px solid rgba(255,255,255,0.1); }
+@media (max-width: 768px) { .stylist-filter-bar { inset-inline-end:65px; } }
+.stylist-filter-select { flex:1; padding:6px; border-radius:6px; border:1px solid var(--border-light); background:var(--bg-input-edit); color:var(--text-main); font-size:12px; cursor:pointer; }
+.chip-group { display:flex; flex-wrap:wrap; gap:8px; margin-top:6px; }
+.chip { background:var(--bg-input); border:1px solid var(--border-light); color:var(--text-sub); padding:6px 12px; border-radius:20px; font-size:11px; cursor:pointer; transition:all 0.2s; user-select:none; }
+.chip.active { background:var(--primary); color:white; border-color:var(--primary); font-weight:bold; }
+.fit-warning-banner { background:rgba(244,67,54,0.15); border:1px solid var(--danger); color:#ff5252; padding:10px; border-radius:6px; font-size:12px; font-weight:bold; display:flex; align-items:center; gap:8px; margin-top:10px; }
+.grid-fit-badge { position:absolute; top:5px; inset-inline-end:5px; background:var(--danger); color:white; font-size:10px; padding:2px 6px; border-radius:10px; font-weight:bold; box-shadow:0 2px 4px rgba(0,0,0,0.5); z-index:5; pointer-events:none; }

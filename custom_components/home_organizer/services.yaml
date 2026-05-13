@@ -22,6 +22,16 @@ add_item:
       description: "Date string"
     image_data:
       description: "Base64 image string"
+    owner:
+      description: "Garment Owner"
+    season:
+      description: "Clothing Season"
+    dress_code:
+      description: "Occasion or Style"
+    clothing_status:
+      description: "Clean, In Laundry, etc"
+    measurements:
+      description: "JSON string of physical measurements"
 
 update_image:
   name: Update Image
@@ -51,6 +61,16 @@ update_item_details:
       required: true
     new_date:
       description: "New date string"
+    owner:
+      description: "Garment Owner"
+    season:
+      description: "Clothing Season"
+    dress_code:
+      description: "Occasion or Style"
+    clothing_status:
+      description: "Clean, In Laundry, etc"
+    measurements:
+      description: "JSON string of physical measurements"
 
 update_qty:
   name: Update Quantity

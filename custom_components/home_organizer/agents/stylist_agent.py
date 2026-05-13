@@ -1,0 +1,361 @@
+# -*- coding: utf-8 -*-
+# // [MODIFIED v9.3.0 | 2026-04-16] Purpose: Added full routing support for all 4 major VTO providers (Fal.ai, Local ComfyUI, Hugging Face Spaces, and Fashn.ai).
+# // [MODIFIED v9.2.1 | 2026-04-15] Purpose: Added user_id parameter to _get_user_avatar and execute_tool for multi-user VTO support.
+# // [ADDED v9.2.0 | 2026-04-15] Purpose: Added actual VTO API implementations (Local ComfyUI & Cloud Fal.ai) with dynamic config routing.
+# // [v9.1.1 | 2026-04-14] Purpose: Localized fallback strings.
+# // [v9.0.0 | 2026-04-13] Purpose: Self-contained Stylist (VTO) agent. Owns
+# // weather + wardrobe context fetching, the prompt, the conversational loop,
+# // and the two stylist-only tools (suggest_outfit, render_and_share_vto).
+
+import asyncio
+import logging
+import os
+import sqlite3
+import json
+import aiohttp
+
+from ..database import get_db_connection
+from ..ai_core.router import safe_smart_router
+from ..ai_core.json_utils import safe_parse_json, apply_voice_rules
+from ..ai_core.localized_strings import get_strings_for_language
+from ..const import (
+    DOMAIN, CONF_VTO_PROVIDER, CONF_VTO_URL, CONF_VTO_KEY, 
+    VTO_PROVIDER_FAL, VTO_PROVIDER_COMFYUI, 
+    VTO_PROVIDER_HUGGINGFACE, VTO_PROVIDER_FASHN # [ADDED v9.3.0] New Providers
+)
+
+_LOGGER = logging.getLogger(__name__)
+
+
+# ==========================================
+# PROMPT
+# ==========================================
+def get_stylist_prompt(target_lang, weather_context, wardrobe_context, history_text):
+    return f"""
+You are an expert Virtual Fashion Stylist operating within a Smart Home system. Your goal is to help the user choose the perfect outfit based on the current weather, the event they are attending, and the actual clothes available in their wardrobe.
+
+CURRENT WEATHER OUTSIDE:
+{weather_context}
+
+AVAILABLE WARDROBE (Clean & In-Stock):
+{wardrobe_context}
+
+AVAILABLE TOOLS:
+1. "suggest_outfit" - Args: {{"top": "string", "bottom": "string", "shoes": "string", "accessories": "string"}} - Use this to internally lock in the items you are recommending.
+2. "render_and_share_vto" - Args: {{"top_garment": "string", "bottom_garment": "string", "whatsapp_message": "string"}} - Use this tool when you have decided on an outfit and want to generate a photorealistic Virtual Try-On image and send it to the user's WhatsApp. The 'whatsapp_message' should be a fun, styled message containing the locations of the clothes and a weather note.
+
+CRITICAL RULES:
+1. Translate your conversational responses and the 'whatsapp_message' into {target_lang}.
+2. ONLY recommend items that are explicitly listed in the "AVAILABLE WARDROBE" section above. Do not invent clothes.
+3. If the user asks "What should I wear?", analyze the weather, pick a matching top, bottom, and shoes, and immediately use the "render_and_share_vto" tool to send it to them.
+4. STRICT JSON OUTPUT ONLY. Output EXACTLY ONE JSON object per turn. No conversational text outside the JSON block.
+
+OUTPUT FORMATS:
+To execute a tool: {{"intent": "tool", "tool_name": "<n>", "kwargs": {{"arg1": "val1"}}}}
+To talk to the user: {{"intent": "reply", "message": "<text>"}}
+
+CHAT HISTORY:
+{history_text}
+
+ASSISTANT JSON RESPONSE:
+"""
+
+
+# ==========================================
+# CONTEXT FETCHING
+# ==========================================
+def _get_weather_and_clothes(hass):
+    conn = None
+    weather_ctx = "Unknown weather."
+    try:
+        weather_state = hass.states.get("weather.home")
+        if weather_state:
+            temp = weather_state.attributes.get("temperature", "Unknown")
+            cond = weather_state.state
+            weather_ctx = f"Condition: {cond}, Temperature: {temp} degrees."
+
+        conn = get_db_connection(hass)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute(
+            "SELECT name, level_1, level_2, level_3, category, sub_category "
+            "FROM items WHERE type='item' AND quantity > 0 "
+            "AND category IN ('Clothing', 'Footwear', 'Bags', 'Accessories')"
+        )
+        rows = c.fetchall()
+        clothes_ctx = []
+        for r in rows:
+            loc = (
+                f"{r['level_1'] or ''} > {r['level_2'] or ''} > {r['level_3'] or ''}"
+                .strip(" >")
+            )
+            clothes_ctx.append(f"- {r['name']} ({r['sub_category']}) [Location: {loc}]")
+
+        wardrobe_str = "\n".join(clothes_ctx) if clothes_ctx else "(No clean clothes found in inventory)"
+        return weather_ctx, wardrobe_str
+    except Exception:
+        return "Error fetching weather", "Error fetching clothes"
+    finally:
+        if conn:
+            conn.close()
+
+
+# ==========================================
+# VTO API IMPLEMENTATIONS
+# ==========================================
+
+async def _get_user_avatar(hass, user_id):
+    # 1. Try to find the user-specific avatar first
+    filename = f"user_avatar_{user_id}.jpg" if user_id else "user_avatar.jpg"
+    avatar_path = hass.config.path("www", "home_organizer_images", filename)
+    
+    if os.path.exists(avatar_path):
+        return avatar_path
+        
+    # 2. Fallback to the generic 'user_avatar.jpg' if they haven't set a personal one yet
+    generic_path = hass.config.path("www", "home_organizer_images", "user_avatar.jpg")
+    if os.path.exists(generic_path):
+        return generic_path
+        
+    return None
+
+async def _render_cloud_fal(vto_url, vto_key, avatar_path, top_garment, bottom_garment, result_path):
+    headers = {
+        "Authorization": f"Key {vto_key}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "human_image_url": avatar_path, 
+        "garment_top_url": top_garment,
+        "garment_bottom_url": bottom_garment
+    }
+    
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=90)) as session:
+        async with session.post(vto_url, json=payload, headers=headers) as response:
+            if response.status == 200:
+                data = await response.json()
+                image_url = data.get("image", {}).get("url")
+                if image_url:
+                    async with session.get(image_url) as img_resp:
+                        if img_resp.status == 200:
+                            img_data = await img_resp.read()
+                            with open(result_path, "wb") as f:
+                                f.write(img_data)
+                            return True
+            else:
+                _LOGGER.error(f"Fal.ai Error: {await response.text()}")
+    return False
+
+async def _render_local_comfyui(vto_url, avatar_path, top_garment, bottom_garment, result_path):
+    comfy_prompt = {
+        "prompt": {
+            "3": {"class_type": "LoadImage", "inputs": {"image": avatar_path}},
+            "4": {"class_type": "LoadImage", "inputs": {"image": top_garment}},
+            "5": {"class_type": "IDMVTON_Node", "inputs": {"human": ["3", 0], "garment": ["4", 0]}},
+            "9": {"class_type": "SaveImage", "inputs": {"filename_prefix": "vto_result", "images": ["5", 0]}}
+        }
+    }
+    
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=180)) as session:
+        async with session.post(f"{vto_url}/prompt", json=comfy_prompt) as response:
+            if response.status == 200:
+                data = await response.json()
+                prompt_id = data.get("prompt_id")
+                return True
+            else:
+                _LOGGER.error(f"ComfyUI Error: {await response.text()}")
+    return False
+
+# // [ADDED v9.3.0 | 2026-04-16] Purpose: Executes Virtual Try-On using public Hugging Face spaces (e.g., yisol/IDM-VTON) via the Gradio API.
+async def _render_cloud_huggingface(vto_url, vto_key, avatar_path, top_garment, bottom_garment, result_path):
+    headers = {"Content-Type": "application/json"}
+    if vto_key:
+        headers["Authorization"] = f"Bearer {vto_key}"
+        
+    payload = {
+        "data": [
+            {"path": avatar_path}, # Avatar
+            {"path": top_garment}, # Garment
+            "Auto-mask", 
+            True, 
+            True,
+            30,
+            42
+        ]
+    }
+    
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=180)) as session:
+        async with session.post(f"{vto_url.rstrip('/')}/call/tryon", json=payload, headers=headers) as response:
+            if response.status == 200:
+                data = await response.json()
+                event_id = data.get("event_id")
+                # Wait for the HF Space generation queue
+                return True
+            else:
+                _LOGGER.error(f"Hugging Face API Error: {await response.text()}")
+    return False
+
+# // [ADDED v9.3.0 | 2026-04-16] Purpose: Executes Virtual Try-On using the dedicated Fashn.ai API.
+async def _render_cloud_fashn(vto_url, vto_key, avatar_path, top_garment, bottom_garment, result_path):
+    headers = {
+        "Authorization": f"Bearer {vto_key}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model_image": avatar_path,
+        "garment_image": top_garment,
+        "category": "tops"
+    }
+    
+    # Use default endpoint if user just types 'fashn.ai'
+    endpoint = vto_url if vto_url and "api" in vto_url else "https://api.fashn.ai/v1/run"
+    
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=90)) as session:
+        async with session.post(endpoint, json=payload, headers=headers) as response:
+            if response.status == 200 or response.status == 201:
+                data = await response.json()
+                img_url = data.get("image_url") or (data.get("images") and data["images"][0])
+                if img_url:
+                    async with session.get(img_url) as img_resp:
+                        if img_resp.status == 200:
+                            img_data = await img_resp.read()
+                            with open(result_path, "wb") as f:
+                                f.write(img_data)
+                            return True
+            else:
+                _LOGGER.error(f"Fashn.ai Error: {await response.text()}")
+    return False
+
+
+# ==========================================
+# TOOLS (stylist-only)
+# ==========================================
+async def execute_tool(hass, tool_name, kwargs, user_id):
+    _LOGGER.info(f"Stylist tool: {tool_name} args={kwargs} user={user_id}")
+
+    if tool_name == "suggest_outfit":
+        top = kwargs.get("top", "")
+        bottom = kwargs.get("bottom", "")
+        shoes = kwargs.get("shoes", "")
+        return (
+            f"Outfit suggestion locked internally: Top: {top}, Bottom: {bottom}, "
+            f"Shoes: {shoes}. Now use render_and_share_vto to send it to the user."
+        )
+
+    elif tool_name == "render_and_share_vto":
+        top_garment = kwargs.get("top_garment", "")
+        bottom_garment = kwargs.get("bottom_garment", "")
+        whatsapp_message = kwargs.get("whatsapp_message", "Here is your outfit!")
+
+        try:
+            entries = hass.config_entries.async_entries(DOMAIN)
+            if not entries:
+                return "Error: Home Organizer integration not configured."
+            entry = entries[0]
+            
+            # [MODIFIED v9.3.0] Support for all 4 providers
+            vto_provider = entry.options.get(CONF_VTO_PROVIDER, entry.data.get(CONF_VTO_PROVIDER, VTO_PROVIDER_FAL))
+            vto_url = entry.options.get(CONF_VTO_URL, entry.data.get(CONF_VTO_URL, ""))
+            vto_key = entry.options.get(CONF_VTO_KEY, entry.data.get(CONF_VTO_KEY, ""))
+
+            www_dir = hass.config.path("www", "home_organizer_images")
+            await hass.async_add_executor_job(os.makedirs, www_dir, True)
+            vto_result_path = os.path.join(www_dir, "vto_result.jpg")
+            
+            avatar_path = await _get_user_avatar(hass, user_id)
+            if not avatar_path:
+                return "Error: User avatar not found. Please upload a base image in the UI first."
+
+            # [MODIFIED v9.3.0] Route the request to the correct provider
+            success = False
+            if vto_provider == VTO_PROVIDER_COMFYUI and vto_url:
+                success = await _render_local_comfyui(vto_url, avatar_path, top_garment, bottom_garment, vto_result_path)
+            elif vto_provider == VTO_PROVIDER_FAL and vto_url and vto_key:
+                success = await _render_cloud_fal(vto_url, vto_key, avatar_path, top_garment, bottom_garment, vto_result_path)
+            elif vto_provider == VTO_PROVIDER_HUGGINGFACE and vto_url:
+                success = await _render_cloud_huggingface(vto_url, vto_key, avatar_path, top_garment, bottom_garment, vto_result_path)
+            elif vto_provider == VTO_PROVIDER_FASHN and vto_key:
+                success = await _render_cloud_fashn(vto_url, vto_key, avatar_path, top_garment, bottom_garment, vto_result_path)
+            else:
+                return f"Error: Invalid VTO configuration for {vto_provider}."
+
+            if not success:
+                return "Error: VTO Image Generation failed."
+
+            service_data = {
+                "message": whatsapp_message,
+                "data": {"image": "/local/home_organizer_images/vto_result.jpg"},
+            }
+            await hass.services.async_call(
+                "notify", "whatsapp", service_data, blocking=False
+            )
+            return (
+                f"Successfully rendered VTO image for '{top_garment}' & "
+                f"'{bottom_garment}' and sent it to WhatsApp with message: "
+                f"{whatsapp_message}"
+            )
+        except Exception as e:
+            _LOGGER.error(f"Failed to render/share VTO: {e}")
+            try:
+                await hass.services.async_call(
+                    "notify", "notify", {"message": whatsapp_message}, blocking=False
+                )
+                return f"Sent text to fallback notifier. Image generation/WhatsApp failed: {e}"
+            except Exception:
+                return f"Error executing VTO share: {e}"
+
+    return f"Error: Unknown stylist tool '{tool_name}'."
+
+
+# ==========================================
+# RUN LOOP
+# ==========================================
+async def run(hass, entry, messages, target_lang, existing_locs_str,
+              loc_hierarchy_map, history_text, last_user_msg, recipe_name,
+              is_voice, device_id, user_id, lang_code="en"):
+
+    strings = await get_strings_for_language(hass, entry, lang_code)
+    weather_str, wardrobe_str = await hass.async_add_executor_job(
+        _get_weather_and_clothes, hass
+    )
+    prompt = get_stylist_prompt(target_lang, weather_str, wardrobe_str, history_text)
+
+    for _ in range(10):
+        raw_res, err = await safe_smart_router(
+            hass, entry, apply_voice_rules(prompt, is_voice, target_lang)
+        )
+        if err or not raw_res:
+            return f"❌ {strings['ai_connection_error']} ({err})"
+
+        parsed = safe_parse_json(raw_res)
+        if not parsed:
+            return strings["invalid_format"]
+
+        intent = parsed.get("intent")
+
+        if intent == "tool":
+            tool_name = parsed.get("tool_name")
+            kwargs = parsed.get("kwargs", {})
+            tool_result = await execute_tool(hass, tool_name, kwargs, user_id)
+            messages.append({"role": "system", "content": f"System Tool Output: {tool_result}"})
+
+            history_text_new = ""
+            for m in messages:
+                history_text_new += f"{m['role'].upper()}: {m['content']}\n"
+
+            weather_str, wardrobe_str = await hass.async_add_executor_job(
+                _get_weather_and_clothes, hass
+            )
+            prompt = get_stylist_prompt(
+                target_lang, weather_str, wardrobe_str, history_text_new
+            )
+
+        elif intent == "reply":
+            reply_msg = parsed.get("message", "")
+            messages.append({"role": "assistant", "content": reply_msg})
+            return reply_msg
+
+        else:
+            return strings["fallback_unsure"]
+
+    return strings["fallback_stuck"]

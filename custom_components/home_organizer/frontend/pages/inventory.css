@@ -1,0 +1,21 @@
+/* pages/inventory.css | v10.0.1 */
+.folder-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(100px, 1fr)); gap: 15px; margin-bottom: 20px; }
+.folder-item { background: var(--bg-card); border: 1px solid var(--border-light); border-radius: 12px; padding: 15px; text-align: center; cursor: pointer; transition: all 0.2s; position: relative; }
+.folder-item:hover { background: var(--bg-card-hover); transform: translateY(-2px); border-color: var(--primary); }
+.android-folder-icon { width: 50px; height: 50px; margin: 0 auto 10px auto; color: var(--primary); display: flex; align-items: center; justify-content: center; }
+.android-folder-icon svg { width: 100%; height: 100%; }
+
+.item-list { display: flex; flex-direction: column; gap: 8px; }
+.item-row { background: var(--bg-card); border-radius: 10px; border: 1px solid var(--border-light); overflow: hidden; transition: border-color 0.2s; }
+.out-of-stock-frame { border: 1px solid var(--danger); opacity: 0.8; }
+.item-main { display: flex; justify-content: space-between; align-items: center; padding: 12px 15px; cursor: pointer; }
+.item-left { display: flex; align-items: center; gap: 12px; flex: 1; overflow: hidden; }
+.item-icon { width: 40px; height: 40px; background: rgba(3,169,244,0.1); color: var(--primary); border-radius: 8px; display: flex; justify-content: center; align-items: center; }
+.item-thumbnail { width: 40px; height: 40px; border-radius: 8px; object-fit: cover; border: 1px solid var(--border-light); }
+
+.item-qty-ctrl { display: flex; align-items: center; background: var(--bg-input-edit); border-radius: 20px; padding: 2px; }
+.qty-btn { background: transparent; border: none; color: var(--text-main); width: 32px; height: 32px; display: flex; justify-content: center; align-items: center; cursor: pointer; font-size: 16px; }
+.qty-val { font-weight: bold; width: 24px; text-align: center; font-size: 14px; }
+
+.expanded-details { padding: 15px; background: rgba(0,0,0,0.2); border-top: 1px solid var(--border-light); display: flex; flex-direction: column; gap: 10px; }
+.group-separator { margin-top: 15px; margin-bottom: 5px; padding-bottom: 5px; border-bottom: 1px solid var(--border-light); color: var(--primary); font-size: 14px; font-weight: bold; display: flex; align-items: center; }

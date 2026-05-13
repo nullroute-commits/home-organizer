@@ -1,0 +1,504 @@
+# -*- coding: utf-8 -*-
+# // [ADDED v9.1.11 | 2026-04-14] Purpose: Fixed sub-location logic where AI created new sub-locations instead of using existing ones. Rewrote Rule 3 to explicitly enforce 'USER LOCATION MATCHING', requiring the AI to match user input to an existing location_id first, and forbidding the use of the sub_location parameter unless explicit permission for a NEW location was granted.
+# // [ADDED v9.1.10 | 2026-04-14] Purpose: Fixed 'Invalid Format' crash caused by the AI using double quotes inside JSON string values. Added JSON FORMATTING SAFETY rule. Also fixed the 'Unsure how to proceed' error by restoring the 'intent: reply' Example 5 and adding the SYSTEM TOOL RESPONSES rule so the AI knows how to acknowledge tool successes.
+# // [ADDED v9.1.9 | 2026-04-14] Purpose: Fixed continuation failure where the AI returned an invalid intent after the user agreed to create a new sub-location. Added Rule 3 explicit instructions to retrieve item context from history, and added Example 4 to explicitly show how to resume the 'tool' intent.
+# // [ADDED v9.1.8 | 2026-04-14] Purpose: Added explicit JSON example for the MISSING SUB-LOCATION PROPOSAL and made the rule more aggressive so the AI doesn't bypass it. AI models heavily rely on few-shot examples, lacking a "clarify" example caused it to force a tool execution.
+# // [ADDED v9.1.7 | 2026-04-14] Purpose: Enforced SILENT CATEGORIZATION rule to strictly forbid the AI from asking the user about internal JSON fields like category, sub_category, or icon. It must now guess the closest match silently.
+# // [ADDED v9.1.6 | 2026-04-14] Purpose: Added 'MISSING SUB-LOCATION PROPOSAL' and 'EXPLICIT NEW SUB-LOCATION' rules. The AI will now proactively ask to create a new sub-location if an item doesn't logically fit into any existing sub-locations, and will seamlessly use the `sub_location` parameter when the user agrees and names it.
+# // [ADDED v9.1.5 | 2026-04-14] Purpose: Added 'create_sub_location' tool to explicitly create empty sub-locations (folders) using 'folder_marker' item_type. Also exposed the 'sub_location' kwarg in 'add_item_to_ho' prompt so the AI can add items into newly created sub-locations on the fly.
+# // [ADDED v9.1.4 | 2026-04-14] Purpose: Refined SUB-LOCATION CLARIFICATION rule to suggest the most logical sub-location (e.g., "Vegetable drawer" for carrots) instead of asking a generic "where to place it" question.
+# // [ADDED v9.1.3 | 2026-04-14] Purpose: Added CRITICAL RULES block to get_agent_prompt to enforce sub-location clarification (asking the user before placing in a broad location) and strict icon/category usage.
+# // [ADDED v9.1.2 | 2026-04-14] Purpose: Injected ICON_PROMPT_CONTEXT into get_agent_prompt and strictly enforced category, sub_category, and icon_key extraction for add_item_to_ho tool to match the reliability of the shopping agent.
+# // [v9.1.1 | 2026-04-14] Purpose: Replaced hard-coded English fallback
+# // strings with lazy-localized lookups via ai_core.localized_strings.
+# // The agent now accepts lang_code and emits every user-facing message
+# // in the user's actual language, even on error/clarify paths where the
+# // LLM didn't provide a translated reply.
+# // [v9.0.0 | 2026-04-13] Purpose: Self-contained Inventory agent. Owns
+# // EVERYTHING related to physical home inventory: prompts (agent, search,
+# // barcode, invoice), the conversational run loop, and the tool
+# // implementations. Nothing outside this file may modify inventory tools.
+
+import logging
+from datetime import datetime
+
+from ..database import get_db_connection, add_item_db_safe
+from ..ai_core.router import safe_smart_router
+from ..ai_core.json_utils import safe_parse_json, apply_voice_rules
+from ..ai_core.localized_strings import get_strings_for_language
+from ..prompt_core import ICON_PROMPT_CONTEXT
+
+_LOGGER = logging.getLogger(__name__)
+
+
+# ==========================================
+# PROMPTS
+# ==========================================
+def get_agent_prompt(target_lang, existing_locs_str, history_text):
+    return f"""You are the Home Organizer AI Agent.
+
+Your goal is to extract information from the user and format it perfectly into JSON commands.
+You manage the physical inventory of a house.
+
+EXISTING PHYSICAL LOCATIONS IN THE HOUSE:
+(You MUST use these precise names and logical structure if the user wants to place something)
+{existing_locs_str}
+
+ICON LIBRARY AND CATEGORIES:
+(Choose the most logical category, sub_category, and icon_key from this list)
+{ICON_PROMPT_CONTEXT}
+
+CRITICAL RULES:
+1. SMART SUB-LOCATION CLARIFICATION: If the user asks to add an item to a broad/general location (e.g., "Fridge") AND you see a perfectly matching sub-location under it in the EXISTING LOCATIONS list, guess the most logical sub-location (e.g., "Vegetable Drawer" for carrots) and return JSON: {{"intent": "clarify", "question": "Should I place it in the <Suggested Sub-Location>? (Translate this naturally to {target_lang})"}}.
+2. MISSING SUB-LOCATION PROPOSAL: If the user wants to add an item to an existing location (e.g., "TV Cabinet", "Fridge") but does NOT specify a sub-location, AND you cannot find a suitable existing sub-location for it, YOU MUST NOT use the "add_item_to_ho" tool yet! Instead, you MUST explicitly ask the user if they want to create a new sub-location. Return JSON: {{"intent": "clarify", "question": "I don't see a specific place for this in the <Location>. Would you like me to open a new sub-location, like '<Suggested Name>'? (Translate naturally to {target_lang})"}}.
+3. USER LOCATION MATCHING & CONTINUATION: If the user answers a clarify question by naming a location (e.g., "in the fridge vegetable drawer"), you MUST thoroughly search the EXISTING LOCATIONS list for the best match. If the full path exists (e.g., "Fridge > Vegetable Drawer"), you MUST use its EXACT `location_id` and leave `sub_location` empty. NEVER use `sub_location` to pass an existing drawer/shelf! ONLY fill the `sub_location` argument if the user explicitly confirmed they want to create a completely NEW, non-existent sub-location. If they name a new location but haven't been asked yet, fall back to Rule 2 and ask for permission first.
+4. SILENT CATEGORIZATION & ICONS: When using the "add_item_to_ho" tool, you MUST independently choose the best matching `category`, `sub_category`, and `icon_key` from the ICON LIBRARY. If no perfect match exists, pick the closest broader category (e.g., "Electronics" for a remote). Do not leave them empty. YOU MUST NEVER ASK THE USER to provide a category, sub_category, or icon. Make the decision yourself silently behind the scenes.
+5. LANGUAGE RULE: Your entire spoken response (the "message" or "question" field) MUST be fully translated into {target_lang}.
+6. SYSTEM TOOL RESPONSES: If the CHAT HISTORY ends with a 'System Tool Output' (meaning a tool just succeeded), you MUST use intent "reply" to politely confirm to the user that the action was completed.
+7. JSON FORMATTING SAFETY: Do NOT use double quotes (") inside your JSON string values (e.g., inside the question or message text). Use single quotes (') for any inner quotes to ensure valid JSON parsing.
+
+AVAILABLE TOOLS (Use "intent": "tool", then specify "tool_name"):
+
+1. "check_sub_locations" - If the user asks to add something to a general area (like "Kitchen" or "Garage"), DO NOT ADD IT YET. First, use this tool to ask the database what sub-locations exist in that room.
+   - kwargs: {{"main_location": "Kitchen"}}
+
+2. "add_item_to_ho" - Adds an item to the home inventory.
+   - You MUST supply the EXACT `location_id` from the existing locations list if it exists.
+   - If the user wants to place the item in a NEW sub-location (e.g., a new shelf or drawer that doesn't exist yet), provide it in the `sub_location` argument.
+   - kwargs: {{"item_name": "Milk", "qty": 2, "location_id": "A1.2", "sub_location": "", "category": "Food", "sub_category": "Dairy", "icon_key": "ICON_LIB_ITEM|Food|Dairy|Milk"}}
+
+3. "create_sub_location" - Creates a NEW, empty sub-location (folder, drawer, shelf) inside an existing location, without adding an item to it.
+   - kwargs: {{"location_id": "A1", "new_sub_location": "Vegetable Drawer"}}
+
+4. "update_last_item" - If the user corrects you on the PREVIOUS turn (e.g. "Actually I meant 3 milks" or "Move it to the fridge").
+   - kwargs: {{"old_name": "Milk", "new_name": "Milk", "new_sub_location": "Fridge"}}
+
+5. "search_inventory" - If the user asks "Do we have X?" or "What's in the pantry?".
+   - kwargs: {{"category": "Food"}}
+
+6. "remove_item" - If the user says "I finished the milk" or "Delete the apples".
+   - kwargs: {{"item_name": "Milk"}}
+
+=== CHAT HISTORY ===
+{history_text}
+====================
+
+Read the LAST message from the user.
+Decide if you need to use a tool, or just reply.
+If you need more information (like exact location or category), use "intent": "clarify".
+
+OUTPUT FORMAT: YOU MUST RETURN ONLY VALID JSON.
+Example 1 (Create empty sub-location):
+{{"intent": "tool", "tool_name": "create_sub_location", "kwargs": {{"location_id": "A1", "new_sub_location": "Vegetable Drawer"}}}}
+
+Example 2 (Missing Sub-Location Clarification - MUST DO THIS IF NO LOGICAL SUB-LOCATION EXISTS):
+{{"intent": "clarify", "question": "I don't see a specific place for the remote in the TV Cabinet. Should I open a new sub-location called 'Top Drawer'?"}}
+
+Example 3 (Continuing after Clarification - User explicitly confirmed a completely NEW location!):
+{{"intent": "tool", "tool_name": "add_item_to_ho", "kwargs": {{"item_name": "Remote", "qty": 1, "location_id": "A1", "sub_location": "Top Drawer", "category": "Electronics", "sub_category": "Computing", "icon_key": "ICON_LIB_ITEM|Electronics|Computing|Laptop"}}}}
+
+Example 4 (Continuing after Clarification - User named an EXISTING location, so use its exact location_id and leave sub_location empty!):
+{{"intent": "tool", "tool_name": "add_item_to_ho", "kwargs": {{"item_name": "Cucumbers", "qty": 4, "location_id": "A1.2.3", "sub_location": "", "category": "Food", "sub_category": "Vegetables", "icon_key": "ICON_LIB_ITEM|Food|Vegetables|Cucumbers"}}}}
+
+Example 5 (Reply after a tool succeeds):
+{{"intent": "reply", "message": "I have successfully added the items. Anything else?"}}
+
+JSON ONLY:"""
+
+
+def get_search_prompt(inventory_context, user_message, target_lang):
+    return f"""You are a smart home inventory assistant.
+
+=== RAW INVENTORY DATA ===
+{inventory_context}
+==========================
+
+=== USER REQUEST ===
+{user_message}
+====================
+
+CRITICAL OUTPUT INSTRUCTIONS:
+1. LANGUAGE RULE: Your ENTIRE response and item names MUST be strictly in {target_lang}.
+2. NORMALIZATION: If the user request contains typos, fix them to correct spelling in your response.
+3. NEVER mix languages. Base your recommendations ONLY on the raw inventory data provided."""
+
+
+def get_barcode_prompt(barcode_str, external_hint, target_lang):
+    return f"""You are the Home Organizer AI. The user has scanned a barcode: {barcode_str}.
+
+{external_hint}
+
+Your job is to cleanly format this product so it looks perfect in a Home Assistant dashboard.
+Format the "name" to be clean, capitalized, and easy to read (Translate the name to {target_lang}!).
+Assign it a logical "category" (e.g., Food, Cleaning, Electronics).
+Assign it a logical "sub_category" (e.g., Dairy, Spices, Cables).
+Suggest a relevant Material Design icon key (e.g., "mdi:food-apple", "mdi:bottle-wine").
+
+You MUST return ONLY a JSON object in this format:
+{{
+  "name": "Cleaned Product Name in {target_lang}",
+  "category": "Main Category",
+  "sub_category": "Sub Category",
+  "icon_key": "mdi:icon-name"
+}}
+
+JSON ONLY:"""
+
+
+def get_invoice_prompt(target_lang, existing_locs_str, existing_cats_str, user_message):
+    prompt = (
+        f"Analyze this document/receipt. Context:\n"
+        f"EXISTING LOCATIONS:\n{existing_locs_str}\n\n"
+        f"EXISTING CATEGORIES: [{existing_cats_str}]\n\n"
+        "RULES:\n"
+        f"1. LANGUAGE RULE: The 'name' value inside the JSON items and the 'message' MUST be written strictly in {target_lang}. NEVER translate item names to English unless {target_lang} is English. Do NOT use the document's original language if it differs from {target_lang}.\n"
+        "2. MAPPING & SUBLOCATIONS: Assign the item to a logical physical location by selecting the appropriate ID from the EXISTING LOCATIONS list above. Do NOT use category names like 'Food' or 'Dairy' as locations.\n"
+        "3. ICON SELECTION & CATEGORIES: Assign the closest standard icon_key from the following list. \n"
+        f"{ICON_PROMPT_CONTEXT}\n"
+        "4. OUTPUT JSON ONLY:\n"
+        "   - If items are clear: {{\"intent\": \"add_invoice\", \"message\": \"<Short success sentence>\", \"items\": [{\"name\": \"...\", \"qty\": 1, \"barcode\": \"12345\", \"location_id\": \"A1.1\", \"category\": \"Food\", \"sub_category\": \"Dairy\", \"icon_key\": \"ICON_LIB_ITEM|Food|Dairy|Milk\"}]}}\n"
+        "   - If ambiguous/unknown: {{\"intent\": \"clarify\", \"question\": \"<Question>\"}}\n"
+        "   - If a barcode or item number is visible next to the item on the receipt, include it in the 'barcode' field (as a string). Otherwise, use '0' for the barcode.\n"
+    )
+
+    if user_message and user_message.strip() != "" and user_message != "Scanned Invoice":
+        prompt += (
+            f"\n\nSPECIAL USER INSTRUCTION:\n"
+            f"The user added this specific request: '{user_message}'. \n"
+            f"Please strictly apply this instruction (e.g. if they specified a location, "
+            f"force that location for the items).\n"
+        )
+
+    prompt += "\nDo NOT use markdown."
+    return prompt
+
+
+# ==========================================
+# TOOLS (inventory-only)
+# ==========================================
+async def execute_tool(hass, tool_name, kwargs, loc_hierarchy_map):
+    _LOGGER.info(f"Inventory tool: {tool_name} args={kwargs}")
+
+    if tool_name == "check_sub_locations":
+        loc_id = kwargs.get("location_id", "")
+        base_path = loc_hierarchy_map.get(loc_id, [])
+
+        if len(base_path) < 2:
+            main_loc = kwargs.get("main_location", loc_id)
+
+            def db_get_subs_fallback():
+                conn = None
+                try:
+                    conn = get_db_connection(hass)
+                    c = conn.cursor()
+                    c.execute(
+                        "SELECT DISTINCT level_3 FROM items "
+                        "WHERE level_2 LIKE ? AND level_3 IS NOT NULL AND level_3 != ''",
+                        (f"%{main_loc}%",),
+                    )
+                    return [r[0] for r in c.fetchall()]
+                except Exception:
+                    return []
+                finally:
+                    if conn:
+                        conn.close()
+
+            subs = await hass.async_add_executor_job(db_get_subs_fallback)
+            target_name = main_loc
+        else:
+            l1, l2 = base_path[0], base_path[1]
+            target_name = l2
+
+            def db_get_subs():
+                conn = None
+                try:
+                    conn = get_db_connection(hass)
+                    c = conn.cursor()
+                    c.execute(
+                        "SELECT DISTINCT level_3 FROM items "
+                        "WHERE level_1=? AND level_2=? AND level_3 IS NOT NULL AND level_3 != ''",
+                        (l1, l2),
+                    )
+                    return [r[0] for r in c.fetchall()]
+                except Exception:
+                    return []
+                finally:
+                    if conn:
+                        conn.close()
+
+            subs = await hass.async_add_executor_job(db_get_subs)
+
+        import re as _re
+        cleaned_subs = []
+        for s in subs:
+            clean_s = _re.sub(r"\[?ORDER_MARKER_\d+\]?[_\s]*", "", str(s)).strip()
+            clean_s = clean_s.replace("[Folder]", "").strip()
+            if clean_s and clean_s not in cleaned_subs:
+                cleaned_subs.append(clean_s)
+
+        if not cleaned_subs:
+            return f"No sub-locations found in '{target_name}'."
+
+        subs_str = ", ".join(cleaned_subs)
+        return f"Found sub-locations: {subs_str}."
+
+    elif tool_name == "add_item_to_ho":
+        nm = kwargs.get("item_name")
+        qt = kwargs.get("qty", 1)
+        loc_id = kwargs.get("location_id", "")
+        sl = kwargs.get("sub_location", "")
+        cat = kwargs.get("category", "General")
+        scat = kwargs.get("sub_category", "")
+        icon = kwargs.get("icon_key", None)
+
+        base_path = loc_hierarchy_map.get(loc_id)
+        if not base_path:
+            fallback_loc = kwargs.get("main_location", loc_id)
+            for k, v in loc_hierarchy_map.items():
+                v_str = " ".join(v).replace("ORDER_MARKER", "")
+                if fallback_loc.lower() in v_str.lower() or fallback_loc in v:
+                    base_path = v
+                    break
+            if not base_path:
+                base_path = [fallback_loc] if fallback_loc else ["General"]
+
+        if sl and len(base_path) > 2:
+            base_path = base_path[:2]
+        full_path = list(base_path)
+        if sl:
+            full_path.append(sl)
+
+        await hass.async_add_executor_job(
+            add_item_db_safe, hass, nm, qt, full_path, cat, scat, "item", icon, "0"
+        )
+        hass.bus.async_fire("home_organizer_db_update")
+        loc_str = " > ".join(full_path)
+        return f"Success! Added {qt} {nm} to {loc_str}."
+
+    elif tool_name == "create_sub_location":
+        loc_id = kwargs.get("location_id", "")
+        new_sub = kwargs.get("new_sub_location", "")
+        
+        if not new_sub:
+            return "Error: No new_sub_location provided."
+
+        base_path = loc_hierarchy_map.get(loc_id)
+        if not base_path:
+            fallback_loc = kwargs.get("main_location", loc_id)
+            for k, v in loc_hierarchy_map.items():
+                v_str = " ".join(v).replace("ORDER_MARKER", "")
+                if fallback_loc.lower() in v_str.lower() or fallback_loc in v:
+                    base_path = v
+                    break
+            if not base_path:
+                base_path = [fallback_loc] if fallback_loc else ["General"]
+
+        if len(base_path) > 2:
+            base_path = base_path[:2]
+            
+        full_path = list(base_path)
+        full_path.append(new_sub)
+
+        # In Home Organizer DB, empty folders are created as type 'folder_marker'
+        # with the name prefixed by '[Folder] '
+        folder_name = f"[Folder] {new_sub}"
+        
+        await hass.async_add_executor_job(
+            add_item_db_safe, hass, folder_name, 0, full_path, "Folder", "", "folder_marker", None, "0"
+        )
+        hass.bus.async_fire("home_organizer_db_update")
+        loc_str = " > ".join(base_path)
+        return f"Success! Created new empty sub-location '{new_sub}' in {loc_str}."
+
+    elif tool_name == "update_last_item":
+        old_n = kwargs.get("old_name")
+        new_n = kwargs.get("new_name", old_n)
+        new_sl = kwargs.get("new_sub_location")
+
+        def db_update():
+            conn = None
+            try:
+                conn = get_db_connection(hass)
+                c = conn.cursor()
+                if new_sl:
+                    c.execute(
+                        "UPDATE items SET name=?, level_3=? WHERE name=? AND type='item'",
+                        (new_n, new_sl, old_n),
+                    )
+                else:
+                    c.execute(
+                        "UPDATE items SET name=? WHERE name=? AND type='item'",
+                        (new_n, old_n),
+                    )
+                conn.commit()
+                return "Updated successfully."
+            except Exception as e:
+                return f"Error: {e}"
+            finally:
+                if conn:
+                    conn.close()
+
+        res = await hass.async_add_executor_job(db_update)
+        hass.bus.async_fire("home_organizer_db_update")
+        return res
+
+    elif tool_name == "remove_item":
+        nm = kwargs.get("item_name", "")
+
+        def db_remove():
+            conn = None
+            try:
+                conn = get_db_connection(hass)
+                c = conn.cursor()
+                c.execute(
+                    "SELECT id, name, level_2, level_3 FROM items "
+                    "WHERE name LIKE ? ORDER BY id DESC LIMIT 1",
+                    (f"%{nm}%",),
+                )
+                row = c.fetchone()
+                if row:
+                    c.execute("DELETE FROM items WHERE id = ?", (row[0],))
+                    conn.commit()
+                    loc_str = f"{row[2]} > {row[3]}" if row[3] else str(row[2])
+                    return f"Deleted '{row[1]}' from {loc_str}."
+                return f"Item '{nm}' not found."
+            except Exception as e:
+                return f"Error: {e}"
+            finally:
+                if conn:
+                    conn.close()
+
+        res = await hass.async_add_executor_job(db_remove)
+        hass.bus.async_fire("home_organizer_db_update")
+        return f"Result: {res}."
+
+    elif tool_name == "search_inventory":
+        cat_filter = kwargs.get("category", "")
+
+        def db_search():
+            conn = None
+            try:
+                conn = get_db_connection(hass)
+                c = conn.cursor()
+                if cat_filter and cat_filter.lower() != "all":
+                    c.execute(
+                        "SELECT name, quantity, level_1, level_2, level_3 "
+                        "FROM items WHERE type='item' AND quantity > 0 "
+                        "AND (category LIKE ? OR name LIKE ?)",
+                        (f"%{cat_filter}%", f"%{cat_filter}%"),
+                    )
+                else:
+                    c.execute(
+                        "SELECT name, quantity, level_1, level_2, level_3 "
+                        "FROM items WHERE type='item' AND quantity > 0"
+                    )
+                return c.fetchall()
+            except Exception as e:
+                _LOGGER.error(f"Search tool error: {e}")
+                return []
+            finally:
+                if conn:
+                    conn.close()
+
+        items = await hass.async_add_executor_job(db_search)
+        if not items:
+            return f"No items found in inventory for category '{cat_filter}'."
+        res_lines = [
+            f"- {r[0]} (x{r[1]}) at {' > '.join([l for l in r[2:] if l])}"
+            for r in items
+        ]
+        inv_str = "\n".join(res_lines[:60])
+        return f"Found {len(items)} items in stock:\n{inv_str}"
+
+    elif tool_name == "update_item_qty":
+        nm = kwargs.get("item_name", "")
+        qty = int(kwargs.get("new_qty", 0))
+
+        def db_update_qty():
+            conn = None
+            try:
+                conn = get_db_connection(hass)
+                c = conn.cursor()
+                today = datetime.now().strftime("%Y-%m-%d")
+
+                c.execute(
+                    "UPDATE items SET quantity = ?, item_date = ? "
+                    "WHERE name = ? AND type='item'",
+                    (qty, today, nm),
+                )
+                if c.rowcount > 0:
+                    conn.commit()
+                    return f"Updated '{nm}' quantity to {qty}."
+
+                c.execute(
+                    "UPDATE items SET quantity = ?, item_date = ? "
+                    "WHERE name LIKE ? AND type='item'",
+                    (qty, today, f"%{nm}%"),
+                )
+                if c.rowcount > 0:
+                    conn.commit()
+                    return f"Updated '{nm}' quantity to {qty}."
+
+                return f"Item '{nm}' not found in database."
+            except Exception as e:
+                return f"Error updating qty: {e}"
+            finally:
+                if conn:
+                    conn.close()
+
+        res = await hass.async_add_executor_job(db_update_qty)
+        hass.bus.async_fire("home_organizer_db_update")
+        return res
+
+    return f"Error: Unknown inventory tool '{tool_name}'."
+
+
+# ==========================================
+# RUN LOOP
+# ==========================================
+async def run(hass, entry, messages, target_lang, existing_locs_str,
+              loc_hierarchy_map, history_text, last_user_msg, recipe_name,
+              is_voice, device_id, user_id, lang_code="en"):
+    strings = await get_strings_for_language(hass, entry, lang_code)
+    prompt = get_agent_prompt(target_lang, existing_locs_str, history_text)
+
+    for _ in range(10):
+        raw_res, err = await safe_smart_router(
+            hass, entry, apply_voice_rules(prompt, is_voice, target_lang)
+        )
+
+        if err or not raw_res:
+            _LOGGER.error(f"Inventory Agent loop error: {err}")
+            return f"❌ {strings['ai_connection_error']} ({err})"
+
+        parsed = safe_parse_json(raw_res)
+        if not parsed:
+            return strings["invalid_format"]
+
+        intent = parsed.get("intent")
+
+        if intent == "tool":
+            tool_name = parsed.get("tool_name")
+            kwargs = parsed.get("kwargs", {})
+            tool_result = await execute_tool(hass, tool_name, kwargs, loc_hierarchy_map)
+            messages.append({"role": "system", "content": f"System Tool Output: {tool_result}"})
+
+            history_text_new = ""
+            for m in messages:
+                history_text_new += f"{m['role'].upper()}: {m['content']}\n"
+            prompt = get_agent_prompt(target_lang, existing_locs_str, history_text_new)
+
+        elif intent == "reply":
+            reply_msg = parsed.get("message", "")
+            messages.append({"role": "assistant", "content": reply_msg})
+            return reply_msg
+
+        elif intent == "clarify":
+            reply_msg = parsed.get("question") or strings["clarify_no_location"]
+            messages.append({"role": "assistant", "content": reply_msg})
+            return reply_msg
+
+        else:
+            return strings["fallback_unsure"]
+
+    return strings["fallback_stuck"]
