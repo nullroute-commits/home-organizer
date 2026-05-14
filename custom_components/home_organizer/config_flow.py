@@ -297,7 +297,7 @@ class HomeOrganizerOptionsFlowHandler(config_entries.OptionsFlow):
             schema[vol.Optional(
                 "cloud_model",
                 default=self.data.get("cloud_model", ""),
-                description="Exact Cloud Model Name. Gemini: 'gemini-1.5-flash-latest'. OpenAI: 'gpt-4o'."
+                description="Exact Cloud Model Name. Gemini: 'gemini-3.1-flash-lite'. OpenAI: 'gpt-4o'."
             )] = str
 
             if provider == PROVIDER_CLAUDE:
